@@ -114,12 +114,12 @@ export default {
     portSharingOn: "开启端口分享",
     concurrency: "最大并发数",
     options: {
-      global: "代理所有流量",
+      global: "不进行分流",
       direct: "直连模式",
       pac: "跟随规则端口",
-      whitelistCn: "大陆白名单",
-      gfwlist: "GFWList",
-      sameAsPacMode: "与规则端口所选模式一致",
+      whitelistCn: "大陆白名单模式",
+      gfwlist: "GFWList模式",
+      sameAsPacMode: "分流规则与规则端口所选模式一致",
       customRouting: "自定义路由规则",
       antiDnsHijack: "仅防止DNS劫持(快速)",
       forwardDnsRequest: "转发DNS请求",
@@ -157,7 +157,11 @@ export default {
                           <p>TCP: {tcpPorts}</p>
                           <p>UDP: {udpPorts}</p>`,
       xtlsNotWithWs: `xtls无法和websocket共存`,
-      grpcShouldWithTls: `gRPC必须启用TLS`
+      grpcShouldWithTls: `gRPC必须启用TLS`,
+      ssPluginImpl:
+        "★默认：使用 simple-obfs 时为等效传输层，v2ray-plugin 时为链式。" +
+        "★链式：shadowsocks 流量会被转发至独立的插件。" +
+        "★等效传输层：直接由 v2ray/xray 核心的传输层处理。"
     }
   },
   customAddressPort: {
@@ -265,7 +269,9 @@ export default {
   },
   version: {
     higherVersionNeeded: "该操作需要 v2rayA 的版本高于{version}",
-    v2rayInvalid: "检测到 geosite.dat, geoip.dat 文件或 v2ray-core 可能未正确安装，请检查"
+    v2rayInvalid:
+      "检测到 geosite.dat, geoip.dat 文件或 v2ray-core 可能未正确安装，请检查",
+    lowCoreVersion: "v2ray-core 版本过低，可能会出现非预期错误"
   },
   about: `<p>v2rayA是V2Ray的一个Web客户端，前端使用Vue.js构建，后端使用Golang构建。</p>
           <p class="about-small">默认端口：</p>

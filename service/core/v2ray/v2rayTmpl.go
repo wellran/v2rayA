@@ -12,7 +12,6 @@ import (
 	"github.com/v2rayA/v2rayA/common"
 	"github.com/v2rayA/v2rayA/common/netTools/netstat"
 	"github.com/v2rayA/v2rayA/common/netTools/ports"
-	"github.com/v2rayA/v2rayA/common/resolv"
 	"github.com/v2rayA/v2rayA/conf"
 	"github.com/v2rayA/v2rayA/core/coreObj"
 	"github.com/v2rayA/v2rayA/core/iptables"
@@ -50,13 +49,19 @@ type Template struct {
 	Observatory *coreObj.Observatory `json:"observatory,omitempty"`
 	API         *coreObj.APIObject   `json:"api,omitempty"`
 
-	Variant      where.Variant      `json:"-"`
-	CoreVersion  string             `json:"-"`
-	Plugins      []plugin.Server    `json:"-"`
-	OutboundTags []string           `json:"-"`
-	ApiCloses    []func()           `json:"-"`
-	ApiPort      int                `json:"-"`
-	Setting      *configure.Setting `json:"-"`
+	Variant               where.Variant       `json:"-"`
+	CoreVersion           string              `json:"-"`
+	Plugins               []plugin.Server     `json:"-"`
+	OutboundTags          []string            `json:"-"`
+	ApiCloses             []func()            `json:"-"`
+	ApiPort               int                 `json:"-"`
+	Setting               *configure.Setting  `json:"-"`
+	PluginManagerInfoList []PluginManagerInfo `json:"-"`
+}
+
+type PluginManagerInfo struct {
+	Link string
+	Port int
 }
 
 func (t *Template) Close() error {
@@ -353,7 +358,6 @@ func (t *Template) setDNS(outbounds []serverInfo, supportUDP map[string]bool) (r
 		}
 	}
 	domainsToLookup = common.Deduplicate(domainsToLookup)
-	var domainsToHosts []string
 	if len(domainsToLookup) > 0 {
 		var dnsList []string
 		if service.CheckTcpDnsSupported() == nil {
@@ -371,57 +375,33 @@ func (t *Template) setDNS(outbounds []serverInfo, supportUDP map[string]bool) (r
 		t.DNS.Servers = append(t.DNS.Servers, d...)
 		routing = append(routing, r...)
 	}
-	// set hosts
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	ech := make(chan error, len(domainsToHosts))
-	for _, domain := range domainsToHosts {
-		wg.Add(1)
-		go func(domain string) {
-			defer wg.Done()
-			ips, err := resolv.LookupHost(domain)
-			if err != nil {
-				ech <- fmt.Errorf("%w: please make sure you're connected to the Internet", err)
-				return
-			}
-			ips = FilterIPs(ips)
-			mu.Lock()
-			if t.DNS.Hosts == nil {
-				t.DNS.Hosts = make(coreObj.Hosts)
-			}
-			if service.CheckHostsListSupported() == nil {
-				t.DNS.Hosts[domain] = ips
-			} else {
-				t.DNS.Hosts[domain] = ips[0]
-			}
-			mu.Unlock()
-		}(domain)
+	// hard code for SNI problem like apple pushing
+	t.DNS.Hosts = make(coreObj.Hosts)
+	if service.CheckHostsListSupported() == nil {
+		t.DNS.Hosts["courier.push.apple.com"] = []string{"1-courier.push.apple.com"}
+	} else {
+		t.DNS.Hosts["courier.push.apple.com"] = "1-courier.push.apple.com"
 	}
-	wg.Wait()
-	select {
-	case err = <-ech:
-		return nil, err
-	default:
-		// deduplicate
-		strRouting := make([]string, 0, len(routing))
-		for _, r := range routing {
-			b, err := jsoniter.Marshal(r)
-			if err != nil {
-				log.Fatal("%v", err)
-			}
-			strRouting = append(strRouting, string(b))
+
+	// deduplicate
+	strRouting := make([]string, 0, len(routing))
+	for _, r := range routing {
+		b, err := jsoniter.Marshal(r)
+		if err != nil {
+			return nil, fmt.Errorf("jsoniter.Marshal: %v", err)
 		}
-		strRouting = common.Deduplicate(strRouting)
-		routing = routing[:0]
-		for _, sr := range strRouting {
-			var r coreObj.RoutingRule
-			if err := jsoniter.Unmarshal([]byte(sr), &r); err != nil {
-				log.Fatal("%v: %v", err, sr)
-			}
-			routing = append(routing, r)
-		}
-		return routing, nil
+		strRouting = append(strRouting, string(b))
 	}
+	strRouting = common.Deduplicate(strRouting)
+	routing = routing[:0]
+	for _, sr := range strRouting {
+		var r coreObj.RoutingRule
+		if err := jsoniter.Unmarshal([]byte(sr), &r); err != nil {
+			return nil, fmt.Errorf("jsoniter.Unmarshal: RoutingRule: %v", err)
+		}
+		routing = append(routing, r)
+	}
+	return routing, nil
 }
 
 // FilterIPs returns filtered IP list.
@@ -510,6 +490,13 @@ func (t *Template) setDNSRouting(routing []coreObj.RoutingRule, supportUDP map[s
 
 func (t *Template) AppendRoutingRuleByMode(mode configure.RulePortMode, inbounds []string) (err error) {
 	firstOutboundTag, _ := t.FirstProxyOutboundName(nil)
+	// apple pushing. #495 #479
+	t.Routing.Rules = append(t.Routing.Rules, coreObj.RoutingRule{
+		Type:        "field",
+		OutboundTag: "direct",
+		InboundTag:  deepcopy.Copy(inbounds).([]string),
+		Domain:      []string{"domain:push-apple.com.akadns.net", "domain:push.apple.com"},
+	})
 	switch mode {
 	case configure.WhitelistMode:
 		// foreign domains with intranet IP should be proxied first rather than directly connected
@@ -581,7 +568,17 @@ func (t *Template) AppendRoutingRuleByMode(mode configure.RulePortMode, inbounds
 					Domain:      []string{"geosite:geolocation-!cn"},
 				})
 		}
+
 		t.Routing.Rules = append(t.Routing.Rules,
+			coreObj.RoutingRule{
+				Type:        "field",
+				OutboundTag: firstOutboundTag,
+				InboundTag:  deepcopy.Copy(inbounds).([]string),
+				// From: https://github.com/Loyalsoldier/geoip/blob/release/text/telegram.txt
+				IP: []string{"91.105.192.0/23", "91.108.4.0/22", "91.108.8.0/21", "91.108.16.0/21", "91.108.56.0/22",
+					"95.161.64.0/20", "149.154.160.0/20", "185.76.151.0/24", "2001:67c:4e8::/48", "2001:b28:f23c::/47",
+					"2001:b28:f23f::/48", "2a0a:f280:203::/48"},
+			},
 			coreObj.RoutingRule{
 				Type:        "field",
 				OutboundTag: "direct",
@@ -782,14 +779,32 @@ func parseRoutingA(t *Template, routingInboundTags []string) error {
 								rr.Domain = append(rr.Domain, v)
 								continue
 							}
+							if k == "ext" {
+								datFilenameAndTag := strings.SplitN(v, ":", 2)
+								if len(datFilenameAndTag) < 2 {
+									return fmt.Errorf("%v: tag is not given", v)
+								}
+								if !asset.DoesV2rayAssetExist(datFilenameAndTag[0]) {
+									return fmt.Errorf("%v: file is not found", datFilenameAndTag[0])
+								}
+							}
 							rr.Domain = append(rr.Domain, fmt.Sprintf("%v:%v", k, v))
 						}
 					}
-					//this is not recommended
+					// unnamed param is not recommended
 					rr.Domain = append(rr.Domain, f.Params...)
 				case "ip":
 					for k, vv := range f.NamedParams {
 						for _, v := range vv {
+							if k == "ext" {
+								datFilenameAndTag := strings.SplitN(v, ":", 2)
+								if len(datFilenameAndTag) < 2 {
+									return fmt.Errorf("%v: tag is not given", v)
+								}
+								if !asset.DoesV2rayAssetExist(datFilenameAndTag[0]) {
+									return fmt.Errorf("%v: file is not found", datFilenameAndTag[0])
+								}
+							}
 							rr.IP = append(rr.IP, fmt.Sprintf("%v:%v", k, v))
 						}
 					}
@@ -1270,9 +1285,9 @@ func (t *Template) resolveOutbounds(
 			usedByBalancer     bool
 			balancerPluginPort int
 		)
-		// a vmessInfo(server template) may is used by multiple serverInfos(a connected server)
+		// an vmessInfo(server template) may be used by multiple serverInfos(a connected server)
 
-		// outbound name is not just v2ray outbound tag, it may is a balancer
+		// outbound name is not just v2ray outbound tag, it may be a balancer
 		type balancer struct {
 			name       string
 			serverInfo *serverInfo
@@ -1305,6 +1320,12 @@ func (t *Template) resolveOutbounds(
 					return nil, nil, err
 				}
 				extraOutbounds = append(extraOutbounds, c.ExtraOutbounds...)
+				if c.PluginManagerServerLink != "" {
+					t.PluginManagerInfoList = append(t.PluginManagerInfoList, PluginManagerInfo{
+						Link: c.PluginManagerServerLink,
+						Port: sInfo.PluginPort,
+					})
+				}
 				var s plugin.Server
 				if len(c.PluginChain) > 0 {
 					s, err = plugin.ServerFromChain(c.PluginChain)
@@ -1338,7 +1359,12 @@ func (t *Template) resolveOutbounds(
 			for _, v := range balancers {
 				c.CoreOutbound.Balancers = append(c.CoreOutbound.Balancers, v.name)
 			}
-
+			if c.PluginManagerServerLink != "" {
+				t.PluginManagerInfoList = append(t.PluginManagerInfoList, PluginManagerInfo{
+					Link: c.PluginManagerServerLink,
+					Port: balancerPluginPort,
+				})
+			}
 			// we use the lowest serverInfo index as the order weight of the balancer outbound
 			weight := -1
 			for _, v := range balancers {
@@ -1406,7 +1432,7 @@ func (t *Template) SetAPI(serverData *ServerData) (port int, err error) {
 			_ = l.Close()
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(30 * time.Millisecond)
 	}
 	if serverData != nil {
 		outbounds := t.outNames()
@@ -1783,6 +1809,12 @@ func (t *Template) InsertMappingOutbound(o serverObj.ServerObj, inboundPort stri
 		} else {
 			t.Plugins = append(t.Plugins, server)
 		}
+	}
+	if c.PluginManagerServerLink != "" {
+		t.PluginManagerInfoList = append(t.PluginManagerInfoList, PluginManagerInfo{
+			Link: c.PluginManagerServerLink,
+			Port: pluginPort,
+		})
 	}
 	var mark = 0x80
 	t.checkAndSetMark(&c.CoreOutbound, mark)
